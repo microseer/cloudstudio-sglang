@@ -13,12 +13,12 @@
 
 | 事实 | 说明 |
 | --- | --- |
-| 全量 BF16 权重 | Ref2VA 约 144GB（DiT 66.3GB + Qwen3-VL 文本编码器 + VAE），必须 4 卡数据中心级 GPU |
+| 全量 BF16 权重 | Ref2VA 约 144GB（DiT 66.3GB + Qwen3-VL 文本编码器 61.7GB + VAE），需多卡数据中心级 GPU（官方多卡配方 4×H100/H200） |
 | AdaLN 精简（pruned） | 33B 参数中约 13B 是 AdaLN 调制分支，推理时可预计算/缓存，**不需要加载**，DiT 从 66.3GB 降到 40.2GB（BF16） |
-| ConvRot INT8 | 无损数据的加载时 W8A8 INT8 旋转量化（[arXiv:2512.03673](https://arxiv.org/abs/2512.03673)），精简 DiT 仅 **20.97GB**；SM8.6 上经 [comfy-kitchen](https://pypi.org/project/comfy-kitchen/) 内核执行（SGLang 自带 JIT 算子仅覆盖 Hopper/Blackwell） |
+| ConvRot INT8 | 基于分组正则哈达玛旋转的即插即用低比特量化（ConvRot，[arXiv:2512.03673](https://arxiv.org/abs/2512.03673)），以 W8A8 INT8 应用于 H3 精简 DiT，仅 **20.97GB**；相对 BF16 有轻微精度损失（官方实测 PSNR 24.81dB）。SM8.6 上经 [comfy-kitchen](https://pypi.org/project/comfy-kitchen/) 内核执行（SGLang 自带 JIT 算子仅覆盖 Hopper/Blackwell） |
 | NVFP4-AWQ 文本编码器 | **15.69GB**；属「压缩存储、BF16/FP16 计算」的内存型格式，**不需要 Blackwell**（Comfy-Org 官方说明） |
 | layerwise offload | 权重不全驻留显存，逐层在 主机内存/NVMe → 显存 间调度；VAE 保持常驻 |
-| 实测参考 | 官方在单张 RTX 4090 24GB 上完成 1344×768/107 帧/20 步 Ref2VA 同级负载，**显存峰值约 18GB**，INT8+FlashAttention 端到端约 303 秒（PSNR 24.81dB vs BF16）。A10 显存带宽（933 GB/s）与 4090（1008 GB/s）接近，预期同档 |
+| 实测参考 | 官方在单张 RTX 4090 24GB 上完成 1344×768/107 帧/20 步 Ref2VA 同级负载，**显存峰值约 18GB**，INT8+FlashAttention 端到端约 303 秒（PSNR 24.81dB vs BF16）。A10 显存同为 24GB，可容纳同样的量化组合；但显存带宽 600 GB/s（4090 为 1008 GB/s，A10 约为其六成），INT8 算力也更低，生成耗时会明显长于该实测值。offload 场景下逐层权重传输走 PCIe Gen4，两者平台相当，实际差距以实测为准 |
 
 ## 下载内容（默认量化组合，合计约 42.5GB）
 
@@ -160,7 +160,7 @@ H3_TE_QUANT=int8_convrot bash /workspace/scripts/download-model.sh
 | `SGLANG_DIT_RESIDENT_LAYERS` | `0` | 常驻显存的 DiT 层数。主机内存/显存有余量时调大可显著加速（如 768p 下谨慎加到 4–6；显存接近上限时先调回 0） |
 | `SGLANG_OFFLOAD_PREFETCH` | `1` | DiT 逐层预取深度 |
 | `SGLANG_ATTENTION_BACKEND` | `fa` | 精确注意力；官方测过 `sol_attn`/`sage_attn` 更快但改变注意力数值、降低 PSNR，属有损选项 |
-| `SGLANG_NUM_GPUS` | 量化 `1` / 全精度自动 | ConvRot 精简 DiT 支持 TP1/2/4，多卡可并行（须保持量化 group 边界） |
+| `SGLANG_NUM_GPUS` | 量化 `1` / 全精度自动 | 量化主要收益是省显存：官方实测 convrot_int8 相对 BF16 单卡提速约 1.07×、4 卡 Ulysses 约 1.15×；多卡并行推荐 Ulysses 序列并行（`--ulysses-degree` = GPU 数） |
 
 量化模式首次启动会编译/初始化内核，加载阶段较慢，属正常现象。生成耗时与主机内存、磁盘强相关：权重在主机内存中 pin 驻时最快；内存不足时每个去噪步从 NVMe 读取几十 GB，**务必使用 NVMe**。
 
@@ -212,7 +212,7 @@ bash /workspace/scripts/request-ref2va.sh               # 生成并下载 MP4
 ## 常见问题
 
 **Q：A10 没有 FP8，为什么量化方案能用？**
-默认量化是 **ConvRot INT8（W8A8 整数）**，不是 FP8；文本编码器的 NVFP4-AWQ 是「压缩存储、BF16 计算」的内存型格式，两者都不依赖 Blackwell/Hopper 的 FP8/NVFP4 硬件。ConvRot INT8 内核在 A10（SM8.6）上由 `comfy-kitchen` 提供（Turing+ 支持），SGLang 会按计算能力自动选择后端。切勿使用 `fp8_scaled` 文件。
+默认量化是 **ConvRot INT8（W8A8 整数）**，不是 FP8；文本编码器的 NVFP4-AWQ 是「压缩存储、BF16 计算」的内存型格式，两者都不依赖 Blackwell/Hopper 的 FP8/NVFP4 硬件。ConvRot INT8 有 jit 与 comfy-kitchen 两个内核后端，SGLang 加载时逐层自动选择，A10（SM8.6）上走 `comfy-kitchen`；也可用 `SGLANG_DIFFUSION_CONVROT_INT8_BACKEND` 强制指定。切勿使用 `fp8_scaled` 文件。
 
 **Q：和 ComfyUI 是什么关系？直接用 ComfyUI 不行吗？**
 权重文件来自 Comfy-Org 的重新打包（魔搭镜像），但推理引擎仍是 **SGLang 原生 H3 管线**（`/v1/videos` HTTP API），不是 ComfyUI。SGLang 官方明确支持加载 Comfy 单文件格式（`--component-weights-paths.*`，格式自动探测）。
