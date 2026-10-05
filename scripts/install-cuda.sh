@@ -8,6 +8,7 @@
 #   3. 同时安装 MiniMax-H3 必需的 ffmpeg / ffprobe（参考视频准备与 MP4 封装）
 #   4. 自动配置 CUDA_HOME / PATH / LD_LIBRARY_PATH 到 ~/.bashrc
 #   5. 幂等：已安装 nvcc 时仍会确保 ffmpeg 存在；CUDA_FORCE=1 可强制重装 CUDA
+#   6. 自动修复基础镜像中损坏的第三方 apt 源（如 URL 带反引号/密钥缺失的 github-cli 源）
 #
 # 可用环境变量：
 #   CUDA_VERSION=12-4   强制指定 CUDA 版本（如 13-0 / 12-9 / 12-8 / 12-6 / 12-4）
@@ -28,15 +29,65 @@ fi
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # -----------------------------------------------------------------------------
+# apt 辅助函数：修复坏源 / 容错更新 / 确保媒体依赖
+# -----------------------------------------------------------------------------
+# 修复基础镜像中损坏的 github-cli apt 源（URL 带反引号、GPG 密钥 NO_PUBKEY 等）。
+# 只处理包含 cli.github.com 的源文件；密钥刷新失败（网络受限）则禁用该源——
+# 本模板不依赖 gh CLI，禁用不影响任何功能。
+repair_broken_apt_sources() {
+  local f
+  shopt -s nullglob
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+    [ -f "$f" ] || continue
+    grep -q 'cli\.github\.com' "$f" 2>/dev/null || continue
+    if [ "${f##*.}" = "list" ] && grep -q '`' "$f"; then
+      warn "检测到 $f 的 URL 含反引号（基础镜像写入错误），已重写该源。"
+      printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
+        | $SUDO tee "$f" >/dev/null
+    fi
+    if command -v wget >/dev/null 2>&1 \
+      && wget -q --timeout=15 -O /tmp/.githubcli-keyring.gpg \
+        https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      && $SUDO tee /usr/share/keyrings/githubcli-archive-keyring.gpg \
+        < /tmp/.githubcli-keyring.gpg >/dev/null; then
+      rm -f /tmp/.githubcli-keyring.gpg
+      log "已刷新 github-cli 源 GPG 密钥。"
+    else
+      warn "github-cli 源密钥不可用（网络受限或已失效），禁用该源：$f"
+      $SUDO mv -f "$f" "${f}.disabled-by-h3" 2>/dev/null || true
+    fi
+  done
+  shopt -u nullglob
+}
+
+# apt-get update 容错：个别第三方源失败时索引仍会部分刷新，不应阻断整体流程
+apt_update() {
+  $SUDO apt-get update -qq || warn "apt-get update 部分软件源失败（已忽略），继续使用可用索引。"
+}
+
+# 幂等确保 ffmpeg / ffprobe 存在；失败仅告警（只影响生成后 ffprobe 探测，不影响服务）
+ensure_ffmpeg() {
+  if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    return 0
+  fi
+  log "安装 MiniMax-H3 媒体依赖 ffmpeg / ffprobe ..."
+  repair_broken_apt_sources
+  apt_update
+  if $SUDO apt-get install -y -qq --no-install-recommends ffmpeg; then
+    log "ffmpeg / ffprobe 安装完成。"
+  else
+    warn "ffmpeg 安装失败（不影响模型服务，仅影响生成后 ffprobe 探测）。"
+    warn "可稍后手动执行：sudo apt-get update && sudo apt-get install -y ffmpeg"
+  fi
+  command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1
+}
+
+# -----------------------------------------------------------------------------
 # 1. 已安装 nvcc 时跳过 CUDA 安装，但仍确保 ffmpeg 媒体依赖存在
 # -----------------------------------------------------------------------------
 if command -v nvcc >/dev/null 2>&1 && [ "${CUDA_FORCE:-0}" != "1" ]; then
   log "检测到已安装 $(nvcc --version | tail -1 | sed 's/^ *//')，跳过 CUDA 安装。"
-  if ! command -v ffmpeg >/dev/null 2>&1; then
-    log "补装 MiniMax-H3 媒体依赖 ffmpeg / ffprobe ..."
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -qq --no-install-recommends ffmpeg
-  fi
+  ensure_ffmpeg || true
   log "如需强制重装 CUDA，请执行：CUDA_FORCE=1 bash $SELF"
   exit 0
 fi
@@ -48,8 +99,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   warn "未检测到 nvidia-smi：当前环境没有挂载 NVIDIA 驱动（可能是 CPU 算力规格）。"
   warn "CUDA Toolkit 安装已跳过；仍继续安装 ffmpeg / ffprobe 媒体依赖。"
   warn "请在 CloudStudio 中切换到 GPU 算力后重新运行：bash $SELF"
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq --no-install-recommends ffmpeg || true
+  ensure_ffmpeg || true
   exit 0
 fi
 
@@ -117,9 +167,11 @@ esac
 # -----------------------------------------------------------------------------
 # 5. 添加 NVIDIA 官方 apt 仓库并安装
 # -----------------------------------------------------------------------------
-log "安装基础依赖（wget / gnupg / ca-certificates / ffmpeg）..."
-$SUDO apt-get update -qq
-$SUDO apt-get install -y -qq --no-install-recommends wget gnupg ca-certificates ffmpeg
+log "安装基础依赖（wget / gnupg / ca-certificates）与媒体依赖（ffmpeg）..."
+repair_broken_apt_sources
+apt_update
+$SUDO apt-get install -y -qq --no-install-recommends wget gnupg ca-certificates
+ensure_ffmpeg || true
 
 KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
 KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/${REPO_DIR}/x86_64/${KEYRING_DEB}"
@@ -128,7 +180,7 @@ wget -q --progress=dot:giga "$KEYRING_URL" -O "/tmp/${KEYRING_DEB}"
 $SUDO dpkg -i "/tmp/${KEYRING_DEB}" >/dev/null
 
 log "通过 apt 安装 cuda-toolkit-${CUDA_VER}（体积约 3-5 GB，耗时较长，请耐心等待）..."
-$SUDO apt-get update -qq
+apt_update
 $SUDO apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_VER}"
 
 # -----------------------------------------------------------------------------
