@@ -190,7 +190,8 @@ H3_TE_QUANT=int8_convrot bash /workspace/scripts/download-model.sh
 │   ├── install-sglang.sh      # SGLang[diffusion] + modelscope + comfy-kitchen
 │   ├── download-model.sh      # 量化权重（默认）/ 官方全量 下载
 │   ├── serve.sh               # Ref2VA 服务启动（自动识别量化配方）
-│   └── request-ref2va.sh      # Ref2VA 生成：提交/轮询/下载
+│   ├── request-ref2va.sh      # Ref2VA 生成：提交/轮询/下载
+│   └── fix-comfy-int8-embedding.sh  # 修复 SGLang「量化TE + layerwise offload」设备不一致 bug
 ├── .vscode/preview.yml        # 运行配置（setup 自动生成，已被 git 忽略）
 ├── models/ .cache/ outputs/ .venv/   # 运行时目录（git 已忽略）
 ├── .gitattributes / .gitignore
@@ -219,6 +220,14 @@ bash /workspace/scripts/request-ref2va.sh               # 生成并下载 MP4
 
 **Q：启动时报找不到量化内核 / convrot？**
 确认安装了 comfy-kitchen：`source /workspace/.venv/bin/activate && pip show comfy-kitchen`；没有则重跑 `bash /workspace/scripts/install-sglang.sh`。使用 W6A8 变体需 `comfy-kitchen>=0.2.27`。
+
+**Q：首次生成报 `Expected all tensors to be on the same device, but got index is on cpu, different from other tensors on cuda:0`（`comfy_int8.py` 第 93 行）？**
+SGLang 的 bug，仅「量化文本编码器 + `--layerwise-offload-components text_encoder`」组合触发：TE 词表（≥256MiB）走「驻留主机内存」优化，`weight` 被搬到 CPU、token 索引也被 hook 强制送 CPU 做 gather，但 INT8 量化层反量化用的 `weight_scale` 仍留在显存，第二级查表设备不一致即崩（bf16 全精度无 `weight_scale`，不受影响）。修复：
+
+```bash
+bash /workspace/scripts/fix-comfy-int8-embedding.sh   # 幂等，自动备份为 *.bak-pre-int8fix
+bash /workspace/scripts/serve.sh                      # 重启服务生效
+```
 
 **Q：显存不足（OOM）？**
 确认 `SGLANG_DIT_RESIDENT_LAYERS=0`（默认）、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（脚本默认导出）；改用 `H3_DIT_QUANT=w6a8` 重新下载；降低分辨率/时长（`SHORT_EDGE`、`DURATION`）。VAE 解码阶段 OOM 时确认没有把 `vae` 加入 `--layerwise-offload-components`（脚本默认不加）。
