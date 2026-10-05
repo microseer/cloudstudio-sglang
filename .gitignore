@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# CloudStudio 工作目录 /workspace 下由安装脚本生成的运行时目录
+.venv/
+venv/
+models/
+.cache/
+outputs/
+
+# 运行配置由 setup.sh 从 config/preview.yml 自动生成
+.vscode/
+
+# 系统/编辑器
+.DS_Store
+*.log

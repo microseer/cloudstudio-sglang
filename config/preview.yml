@@ -1,0 +1,20 @@
+# CloudStudio 运行配置（应用模式下点击「运行」即执行）
+# 文档：https://ide.cloud.tencent.com/docs/guide/quick_start/developer/how-to-run/
+#
+# 本文件由 scripts/setup.sh 自动复制到 /workspace/.vscode/preview.yml。
+# 面向 A10（24GB）等单卡环境：默认使用量化权重（约 43GB）+ layerwise offload，
+# MiniMax-H3 Ref2VA 首次使用前请先在终端执行一次：
+#   bash /workspace/scripts/setup.sh
+# 并切换到 A10（24GB）或更高级别的 GPU 算力规格（建议主机内存 ≥64GB、NVMe）。
+apps:
+  - name: MiniMax-H3 Ref2VA 推理服务（A10 量化版）
+    # Ref2VA 官方约定端口 30011（FL2VA 为 30010）
+    port: 30011
+    # 一键启动脚本：自动检测量化权重，单卡 layerwise offload + ConvRot INT8
+    run: bash scripts/serve.sh
+    root: .
+    # 模型体积大且需要 GPU，不自动拉起，改为手动点击「运行」
+    autoOpen: false
+    autoPreview: false
+    # 应用主页预览时优先打开本服务
+    mainPort: true

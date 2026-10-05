@@ -1,0 +1,5 @@
+# CloudStudio 运行环境为 Linux，强制 shell 脚本与模板文件使用 LF 换行，
+# 避免在 Windows 上克隆/编辑后出现 "/usr/bin/env: 'bash\r': No such file" 错误
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
