@@ -218,6 +218,32 @@ bash /workspace/scripts/request-ref2va.sh               # 生成并下载 MP4
 **Q：和 ComfyUI 是什么关系？直接用 ComfyUI 不行吗？**
 权重文件来自 Comfy-Org 的重新打包（魔搭镜像），但推理引擎仍是 **SGLang 原生 H3 管线**（`/v1/videos` HTTP API），不是 ComfyUI。SGLang 官方明确支持加载 Comfy 单文件格式（`--component-weights-paths.*`，格式自动探测）。
 
+**Q：启动时报 `unsupported GNU version! gcc versions later than 12 are not supported`（JIT 编译失败）？**
+基础镜像的 gcc 比预装 nvcc 支持的上限新（如 CUDA 12.2 只支持 gcc≤12，而 Ubuntu 24.04 自带 gcc13），SGLang 启动时需要用 nvcc 现场编译 QKNorm+RoPE 等 JIT 内核。两种解决方式：
+
+**方式 A（推荐，约 100MB）**：安装旧版编译器，通过 `NVCC_CCBIN`（等效 nvcc 的 `-ccbin`，JIT 编译子进程自动继承）指定：
+
+```bash
+apt-get update && apt-get install -y gcc-12 g++-12
+# 之后每次启动都带该前缀（CloudStudio 内为 root；非 root 环境前面加 sudo）：
+NVCC_CCBIN=/usr/bin/g++-12 bash scripts/serve.sh
+# 也可写入 shell 配置免去每次手打：echo 'export NVCC_CCBIN=/usr/bin/g++-12' >> ~/.bashrc
+```
+
+**方式 B**：升级 CUDA Toolkit（3–5GB 下载，见下一问），升级后系统 gcc 直接被新 nvcc 接受。
+
+**Q：可以升级 CUDA 吗？**
+可以，但**不建议仅为解决 JIT 编译问题而升级**：pip 安装的 PyTorch 自带整套 CUDA 运行时，系统 nvcc 只用于 JIT 内核编译，升级 CUDA 对推理性能/显存/速度没有提升（GCC 版本门槛用上面的方式 A 约 100MB 即可解决）。确有需要（如以后要用新工具链特性）时按下面操作：
+
+```bash
+nvidia-smi | head -1                        # 先确认驱动：Driver ≥ 525.60.13 才兼容 CUDA 12.x 工具链
+CUDA_FORCE=1 bash scripts/install-cuda.sh   # 强制按驱动能力重装/升级 CUDA Toolkit（NVIDIA 官方 apt 仓库，3-5GB）
+source ~/.bashrc && nvcc --version          # 确认新版本生效；/usr/local/cuda 链接由安装包自动切换
+bash scripts/serve.sh                       # 新 nvcc 支持系统 gcc13，无需 NVCC_CCBIN 直接启动
+```
+
+升级后首次启动会重新编译全部 JIT 内核（旧缓存按 nvcc 版本分目录存放，互不干扰），耗时稍长属正常。
+
 **Q：启动时报找不到量化内核 / convrot？**
 确认安装了 comfy-kitchen：`source /workspace/.venv/bin/activate && pip show comfy-kitchen`；没有则重跑 `bash /workspace/scripts/install-sglang.sh`。使用 W6A8 变体需 `comfy-kitchen>=0.2.27`。
 
