@@ -280,12 +280,20 @@ if [ "$PROFILE" != "bf16" ]; then
   log "OOM 降档（官方顺序）：SGLANG_DIT_RESIDENT_LAYERS=0 → 仍冲突则 SGLANG_VIDEO_VAE_RESIDENT=24"
 fi
 log "服务就绪后测试：curl http://localhost:$PORT/health"
-exec sglang serve \
-  --model-path "$MODEL" \
-  --model-variant ref2va \
-  "${TOPO_ARGS[@]}" \
-  "${RECIPE_ARGS[@]}" \
-  --host "$HOST" \
-  --port "$PORT" \
-  "${EXTRA[@]}" \
+
+CMD=(
+  sglang serve
+  --model-path "$MODEL"
+  --model-variant ref2va
+  "${TOPO_ARGS[@]}"
+  "${RECIPE_ARGS[@]}"
+  --host "$HOST"
+  --port "$PORT"
+  "${EXTRA[@]}"
   "${PASSTHROUGH[@]}"
+)
+# %q 转义保证含空格/特殊字符的路径复制回 shell 仍可整体执行
+printf -v CMD_STR '%q ' "${CMD[@]}"
+log "最终启动命令：
+$CMD_STR"
+exec "${CMD[@]}"
