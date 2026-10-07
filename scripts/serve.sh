@@ -7,14 +7,21 @@
 #
 # 【量化模式 prequant】（本模板默认，面向 A10 / RTX 3090 / 4090 等 24GB 单卡）
 #   检测到 /workspace/models/Comfy-MiniMax-H3 下的 Comfy 量化权重时启用，
-#   对齐官方「1×RTX 4090 24GB」配方：
+#   对齐官方消费级卡配方（32GB 主机 / 22GiB cap 实测基准，480P）：
 #     --component-weights-paths.{transformer,text_encoder,video_vae,audio_vae}
 #                                 指向 4 个量化权重（预量化文件自描述，禁止再
 #                                 加 --quantization）
 #     --performance-mode memory
-#     --layerwise-offload-components dit,text_encoder   （VAE 保持常驻）
-#     --dit-offload-prefetch-size 1 --dit-layerwise-resident-layers 0
+#     --layerwise-offload-components dit,text_encoder,vae
+#                                 （VAE 也逐层 offload，搭配 video_vae=36 部分
+#                                  常驻——不带常驻的纯 offload 会让解码 167 个
+#                                  tile 各重复流式传输约 9GB）
+#     --layerwise-resident-layers video_vae=36
+#     --dit-offload-prefetch-size 1 --dit-layerwise-resident-layers 6
 #     --attention-backend fa  --enable-torch-compile false
+#   官方实测：6 层 DiT 常驻 + 32GB 主机 ≈ 8.5s/步、解码约 9.6s。
+#   OOM 降档顺序（官方注释原文，先快后稳）：768P 下先把 DiT 常驻降到 0，
+#   解码仍冲突再把 video_vae 降到 24；这两个旋钮按此顺序用显存换余量。
 #   ConvRot INT8 在 CC 8.6/8.9 自动走 comfy-kitchen（须先安装）。
 #
 # 【在线量化模式 online】已下载官方 BF16 全量权重（H3_WEIGHTS=online）且
@@ -39,8 +46,13 @@
 #   SGLANG_NUM_GPUS=1             GPU 数（量化配方默认 1；全精度默认检测到的卡数）
 #   SGLANG_ULYSSES_DEGREE=        Ulysses 度（默认与 GPU 数相同）
 #   SGLANG_TP_SIZE=               可选 tensor parallel size
-#   SGLANG_DIT_RESIDENT_LAYERS=0  量化模式常驻 DiT 层数（主机内存充足可调大加速）
+#   SGLANG_DIT_RESIDENT_LAYERS=6  量化模式常驻 DiT 层数（官方 32GB 主机基准值；
+#                                 OOM 时先降 0，速度换显存）
+#   SGLANG_VIDEO_VAE_RESIDENT=36  video_vae 部分常驻层数（解码 OOM 时降到 24）
 #   SGLANG_OFFLOAD_PREFETCH=1     DiT layerwise 预取层数
+#   SGLANG_WARMUP_RESOLUTION=     可选，按实际出片分辨率预热（如 1024x576），
+#                                 避免默认 1344x768x124 帧预热拖慢启动
+#   SGLANG_WARMUP_FRAMES=         可选，预热帧数（与上一项搭配使用）
 #   SGLANG_ATTENTION_BACKEND=fa   注意力后端（fa 精确；sol_attn/sage_attn 更快但有损）
 #   COMFY_MODEL_DIR=...           量化权重目录（默认 /workspace/models/Comfy-MiniMax-H3）
 #   SGLANG_EXTRA_ARGS='...'       额外启动参数（字符串形式）
@@ -191,19 +203,29 @@ fi
 RECIPE_ARGS=()
 case "$PROFILE" in
   prequant|online)
-    # 减少显存碎片（官方 12/24GB 配方同款）
+    # 减少显存碎片（官方注释明确要求；解码贴近显存上限时无此项会被碎片压垮）
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-    RESIDENT="${SGLANG_DIT_RESIDENT_LAYERS:-0}"
+    RESIDENT="${SGLANG_DIT_RESIDENT_LAYERS:-6}"
+    VAE_RESIDENT="${SGLANG_VIDEO_VAE_RESIDENT:-36}"
     PREFETCH="${SGLANG_OFFLOAD_PREFETCH:-1}"
     ATTN="${SGLANG_ATTENTION_BACKEND:-fa}"
+    # VAE 加入 offload 必须搭配 video_vae 部分常驻（官方消费级卡配方），
+    # 否则 167 个解码 tile 每个都要重流约 9GB
     RECIPE_ARGS=(
       --attention-backend "$ATTN"
       --performance-mode memory
-      --layerwise-offload-components dit,text_encoder
+      --layerwise-offload-components dit,text_encoder,vae
+      --layerwise-resident-layers "video_vae=$VAE_RESIDENT"
       --dit-offload-prefetch-size "$PREFETCH"
       --dit-layerwise-resident-layers "$RESIDENT"
       --enable-torch-compile false
     )
+    if [ -n "${SGLANG_WARMUP_RESOLUTION:-}" ]; then
+      RECIPE_ARGS+=(--warmup-resolutions "$SGLANG_WARMUP_RESOLUTION")
+    fi
+    if [ -n "${SGLANG_WARMUP_FRAMES:-}" ]; then
+      RECIPE_ARGS+=(--warmup-num-frames "$SGLANG_WARMUP_FRAMES")
+    fi
     if [ "$PROFILE" = prequant ]; then
       # 预量化文件自描述：禁止再加 --quantization（SGLang 量化文档明确要求）
       RECIPE_ARGS+=(
@@ -253,6 +275,10 @@ if [ "$PROFILE" = "prequant" ]; then
   log "  audio_vae   = $AUDIO_VAE_WEIGHTS"
 fi
 log "拓扑：gpus=$NUM_GPUS ulysses=$ULYSSES_DEGREE${SGLANG_TP_SIZE:+ tp=$SGLANG_TP_SIZE}，端口：$PORT"
+if [ "$PROFILE" != "bf16" ]; then
+  log "offload：dit+text_encoder+vae，DiT 常驻 $RESIDENT 层，video_vae 常驻 $VAE_RESIDENT 层"
+  log "OOM 降档（官方顺序）：SGLANG_DIT_RESIDENT_LAYERS=0 → 仍冲突则 SGLANG_VIDEO_VAE_RESIDENT=24"
+fi
 log "服务就绪后测试：curl http://localhost:$PORT/health"
 exec sglang serve \
   --model-path "$MODEL" \

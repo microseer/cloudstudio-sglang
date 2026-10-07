@@ -87,14 +87,15 @@ sglang serve \
   --component-weights-paths.audio_vae /workspace/models/Comfy-MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors \
   --attention-backend fa \
   --performance-mode memory \
-  --layerwise-offload-components dit,text_encoder \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --layerwise-resident-layers video_vae=36 \
   --dit-offload-prefetch-size 1 \
-  --dit-layerwise-resident-layers 0 \
+  --dit-layerwise-resident-layers 6 \
   --enable-torch-compile false \
   --host 0.0.0.0 --port 30011
 ```
 
-依据：SGLang Cookbook「1×RTX 4090 24GB」配方。注意 **VAE 不放进 offload 列表**（避免 167 个解码 tile 各重复流式传输约 9GB）；预量化文件自描述，**不能再加 `--quantization`**。
+依据：官方消费级卡配方（32GB 主机 / 22GiB cap 实测基准，480P：6 层 DiT 常驻约 8.5s/步、解码约 9.6s）。注意 **VAE 加入 offload 必须搭配 `--layerwise-resident-layers video_vae=36` 部分常驻**（否则 167 个解码 tile 每个重复流式传输约 9GB）；预量化文件自描述，**不能再加 `--quantization`**；`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 不可去掉（解码贴近显存上限，缺了会被内存碎片压垮）。
 
 ### 第四步：发起 Ref2VA 生成
 
@@ -157,10 +158,14 @@ H3_TE_QUANT=int8_convrot bash /workspace/scripts/download-model.sh
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `SGLANG_DIT_RESIDENT_LAYERS` | `0` | 常驻显存的 DiT 层数。主机内存/显存有余量时调大可显著加速（如 768p 下谨慎加到 4–6；显存接近上限时先调回 0） |
+| `SGLANG_DIT_RESIDENT_LAYERS` | `6` | 常驻显存的 DiT 层数（官方 32GB 主机基准值，每层 1.23GB）。显存吃紧先降到 `0`；主机内存/显存充裕可继续调大提速 |
+| `SGLANG_VIDEO_VAE_RESIDENT` | `36` | video_vae 部分常驻层数（VAE 已加入 offload，靠部分常驻避免逐 tile 重流）。解码 OOM 时降到 `24` |
 | `SGLANG_OFFLOAD_PREFETCH` | `1` | DiT 逐层预取深度 |
+| `SGLANG_WARMUP_RESOLUTION` / `SGLANG_WARMUP_FRAMES` | 未设 | 按实际出片形状预热（如 `1024x576` + `96`）。默认预热按 1344x768×124 帧进行，既拖慢启动又按用不到的请求尺寸规划常驻方案 |
 | `SGLANG_ATTENTION_BACKEND` | `fa` | 精确注意力；官方测过 `sol_attn`/`sage_attn` 更快但改变注意力数值、降低 PSNR，属有损选项 |
 | `SGLANG_NUM_GPUS` | 量化 `1` / 全精度自动 | 量化主要收益是省显存：官方实测 convrot_int8 相对 BF16 单卡提速约 1.07×、4 卡 Ulysses 约 1.15×；多卡并行推荐 Ulysses 序列并行（`--ulysses-degree` = GPU 数） |
+
+官方 OOM 降档顺序（先快后稳，用显存换余量）：**768P 下先把 DiT 常驻降到 0，解码仍冲突再把 video_vae 降到 24**。官方注释另提示：主机的 pin 预算占加载后可用内存的 95%，桌面共用机器可能有交换压力，加大常驻层数是官方唯一的缓解手段（常驻层不再需要 pin）。
 
 量化模式首次启动会编译/初始化内核，加载阶段较慢，属正常现象。生成耗时与主机内存、磁盘强相关：权重在主机内存中 pin 驻时最快；内存不足时每个去噪步从 NVMe 读取几十 GB，**务必使用 NVMe**。
 
@@ -256,7 +261,7 @@ bash /workspace/scripts/serve.sh                      # 重启服务生效
 ```
 
 **Q：显存不足（OOM）？**
-确认 `SGLANG_DIT_RESIDENT_LAYERS=0`（默认）、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（脚本默认导出）；改用 `H3_DIT_QUANT=w6a8` 重新下载；降低分辨率/时长（`SHORT_EDGE`、`DURATION`）。VAE 解码阶段 OOM 时确认没有把 `vae` 加入 `--layerwise-offload-components`（脚本默认不加）。
+默认配方已按官方消费级卡参数将 VAE 加入 offload（`video_vae=36` 部分常驻）、DiT 常驻 6 层。仍 OOM 时按官方顺序降档：先 `SGLANG_DIT_RESIDENT_LAYERS=0`，解码仍冲突再 `SGLANG_VIDEO_VAE_RESIDENT=24`；还不行降低分辨率/时长（`SHORT_EDGE`、`DURATION`）或改用 `H3_DIT_QUANT=w6a8` 重新下载。`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（脚本默认导出）不可去掉——解码贴近显存上限，内存碎片会把它压垮。
 
 **Q：生成很慢？**
 量化 offload 方案速度取决于主机内存与磁盘：内存 ≥64GB 时权重可 pin 驻，接近计算墙；32GB 主机主要靠 NVMe 流式传输。请使用 PCIe NVMe SSD 并关闭占内存的其他进程。参考量级：官方 4090 在 768p/107 帧/20 步下约 5 分钟一条（INT8+FA）。
